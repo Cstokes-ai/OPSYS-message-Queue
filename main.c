@@ -176,7 +176,7 @@ int main(int argc, char *argv[]) {
     // Cleanup shared memory
     shmdt(sysClock);
     shmctl(shmid, IPC_RMID, NULL);
-    printf("Shared Memory Removed: shmid = %d\n", shmid);
+    printf("Shared Memory Removed shmid = %d\n", shmid);
 
     return 0;
 }

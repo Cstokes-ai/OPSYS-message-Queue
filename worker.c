@@ -99,7 +99,7 @@ void run_worker(int maxSec, int maxNano) {
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <maxSeconds> <maxNanoseconds>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <maxSeconds> <maxNanoseconds\n", argv[0]);
         return EXIT_FAILURE;
     }
 

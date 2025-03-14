@@ -4,8 +4,7 @@
 #include <sys/shm.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
-#include <sys/wait.h>
-#include <time.h>
+#include <sys/types.h>
 
 #define SHM_KEY 12345
 #define MSG_KEY 54321

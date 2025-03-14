@@ -6,6 +6,7 @@
 #include <sys/msg.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <time.h>
 
 #define SHM_KEY 12345
 #define MSG_KEY 54321
@@ -46,7 +47,8 @@ void cleanup(int signum) {
 }
 
 void incrementClock(int childrenRunning) {
-    simClock->nanoseconds += 1000000;
+    int increment = 250000000 / (childrenRunning > 0 ? childrenRunning : 1);
+    simClock->nanoseconds += increment;
     if (simClock->nanoseconds >= 1000000000) {
         simClock->seconds++;
         simClock->nanoseconds -= 1000000000;
@@ -58,8 +60,36 @@ int main(int argc, char *argv[]) {
     int simul = 2;
     int timeLimit = 5;
     int interval = 100;
+    char *logFileName = "oss.log";
 
-    logFile = fopen("oss.log", "w");
+    int opt;
+    while ((opt = getopt(argc, argv, "hn:s:t:i:f:")) != -1) {
+        switch (opt) {
+            case 'h':
+                printf("Usage: %s [-h] [-n proc] [-s simul] [-t timelimitForChildren] [-i intervalInMsToLaunchChildren] [-f logfile]\n", argv[0]);
+                exit(EXIT_SUCCESS);
+            case 'n':
+                numProcs = atoi(optarg);
+                break;
+            case 's':
+                simul = atoi(optarg);
+                break;
+            case 't':
+                timeLimit = atoi(optarg);
+                break;
+            case 'i':
+                interval = atoi(optarg);
+                break;
+            case 'f':
+                logFileName = optarg;
+                break;
+            default:
+                fprintf(stderr, "Usage: %s [-h] [-n proc] [-s simul] [-t timelimitForChildren] [-i intervalInMsToLaunchChildren] [-f logfile]\n", argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
+
+    logFile = fopen(logFileName, "w");
     if (!logFile) {
         perror("fopen failed");
         exit(EXIT_FAILURE);

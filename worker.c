@@ -4,7 +4,8 @@
 #include <sys/shm.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
-#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 
 #define SHM_KEY 12345
 #define MSG_KEY 54321
@@ -50,25 +51,42 @@ void run_worker(int maxSec, int maxNano) {
            getpid(), getppid(), simClock->seconds, simClock->nanoseconds, termSec, termNano);
 
     struct msgbuf msg;
+    msg.mtype = getpid();
     int iterations = 0;
 
     do {
-        msgrcv(msqid, &msg, MSG_SIZE, getpid(), 0);
+        // Wait for message from oss
+        if (msgrcv(msqid, &msg, MSG_SIZE, getpid(), 0) == -1) {
+            perror("msgrcv failed");
+            exit(EXIT_FAILURE);
+        }
+
+        // Check if it's time to terminate
         if (simClock->seconds > termSec || (simClock->seconds == termSec && simClock->nanoseconds >= termNano)) {
-            msg.mtext = 0;
-            msgsnd(msqid, &msg, MSG_SIZE, 0);
+            msg.mtext = 0; // Indicate termination
+            if (msgsnd(msqid, &msg, MSG_SIZE, 0) == -1) {
+                perror("msgsnd failed");
+                exit(EXIT_FAILURE);
+            }
             printf("WORKER PID:%d SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d --Terminating after %d iterations\n",
                    getpid(), simClock->seconds, simClock->nanoseconds, termSec, termNano, iterations);
             break;
         } else {
-            msg.mtext = 1;
-            msgsnd(msqid, &msg, MSG_SIZE, 0);
-            printf("WORKER PID:%d PPID:%d SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d --%d iterations have passed since starting\n",
-                   getpid(), getppid(), simClock->seconds, simClock->nanoseconds, termSec, termNano, ++iterations);
+            msg.mtext = 1; // Indicate still running
+            if (msgsnd(msqid, &msg, MSG_SIZE, 0) == -1) {
+                perror("msgsnd failed");
+                exit(EXIT_FAILURE);
+            }
+            printf("WORKER PID:%d PPID:%d SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d --%d iteration%s have passed since starting\n",
+                   getpid(), getppid(), simClock->seconds, simClock->nanoseconds, termSec, termNano, ++iterations,
+                   iterations == 1 ? "" : "s");
         }
     } while (1);
 
-    shmdt(simClock);
+    if (shmdt(simClock) == -1) {
+        perror("shmdt failed");
+        exit(EXIT_FAILURE);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -79,8 +97,8 @@ int main(int argc, char *argv[]) {
 
     int maxSec = atoi(argv[1]);
     int maxNano = atoi(argv[2]);
-    if (maxSec < 0 || maxNano < 0) {
-        fprintf(stderr, "Error: maxSeconds and maxNanoseconds must be non-negative integers.\n");
+    if (maxSec < 0 || maxNano < 0 || maxNano >= 1000000000) {
+        fprintf(stderr, "Error: Invalid input. maxSeconds must be non-negative and maxNanoseconds must be between 0 and 999999999.\n");
         return EXIT_FAILURE;
     }
 

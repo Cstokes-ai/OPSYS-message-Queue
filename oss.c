@@ -1,17 +1,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/shm.h>
+#include <sys/types.h>
 #include <sys/ipc.h>
+#include <sys/shm.h>
 #include <sys/msg.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
+#include <errno.h>
+#include <string.h>
 
 #define SHM_KEY 12345
 #define MSG_KEY 54321
-#define MSG_SIZE sizeof(struct msgbuf) - sizeof(long)
 #define MAX_CHILDREN 20
+#define MSG_SIZE sizeof(struct msgbuf) - sizeof(long)
 
 typedef struct {
     int seconds;
@@ -26,28 +29,31 @@ struct msgbuf {
 typedef struct {
     int occupied;
     pid_t pid;
-    int startSec;
-    int startNano;
+    int startS;
+    int startN;
     int messagesSent;
-} ProcessTableEntry;
+} PCBEntry;
 
-ProcessTableEntry processTable[MAX_CHILDREN];
-SharedClock *simClock;
+PCBEntry processTable[MAX_CHILDREN];
 int shmid, msqid;
-FILE *logFile;
+SharedClock *simClock;
+FILE *logfile;
 
-void cleanup(int signum) {
+void cleanup() {
     shmdt(simClock);
     shmctl(shmid, IPC_RMID, NULL);
     msgctl(msqid, IPC_RMID, NULL);
-    if (logFile) {
-        fclose(logFile);
-    }
+    if (logfile) fclose(logfile);
+}
+
+void sigint_handler(int sig) {
+    fprintf(logfile, "Caught SIGINT, terminating...\n");
+    cleanup();
     exit(0);
 }
 
-void incrementClock(int childrenRunning) {
-    int increment = 250000000 / (childrenRunning > 0 ? childrenRunning : 1);
+void incrementClock(int children) {
+    int increment = 250000000 / (children > 0 ? children : 1);
     simClock->nanoseconds += increment;
     if (simClock->nanoseconds >= 1000000000) {
         simClock->seconds++;
@@ -55,129 +61,130 @@ void incrementClock(int childrenRunning) {
     }
 }
 
-int main(int argc, char *argv[]) {
-    int numProcs = 5;
-    int simul = 2;
-    int timeLimit = 5;
-    int interval = 100;
-    char *logFileName = "oss.log";
+void printProcessTable() {
+    fprintf(logfile, "OSS PID:%d SysClockS:%d SysClockNano:%d\n", getpid(), simClock->seconds, simClock->nanoseconds);
+    fprintf(logfile, "Process Table:\n");
+    fprintf(logfile, "Entry Occupied PID StartS StartN MessagesSent\n");
+    for (int i = 0; i < MAX_CHILDREN; i++) {
+        fprintf(logfile, "%d %d %d %d %d %d\n", i, processTable[i].occupied, processTable[i].pid,
+                processTable[i].startS, processTable[i].startN, processTable[i].messagesSent);
+    }
+    fprintf(logfile, "\n");
+    fflush(logfile);
+}
 
-    int opt;
+int main(int argc, char *argv[]) {
+    int opt, proc = 1, simul = 1, timelimit = 2, interval = 100;
+    char *logfilename = "oss.log";
+
     while ((opt = getopt(argc, argv, "hn:s:t:i:f:")) != -1) {
         switch (opt) {
             case 'h':
-                printf("Usage: %s [-h] [-n proc] [-s simul] [-t timelimitForChildren] [-i intervalInMsToLaunchChildren] [-f logfile]\n", argv[0]);
-                exit(EXIT_SUCCESS);
-            case 'n':
-                numProcs = atoi(optarg);
-                break;
-            case 's':
-                simul = atoi(optarg);
-                break;
-            case 't':
-                timeLimit = atoi(optarg);
-                break;
-            case 'i':
-                interval = atoi(optarg);
-                break;
-            case 'f':
-                logFileName = optarg;
-                break;
-            default:
-                fprintf(stderr, "Usage: %s [-h] [-n proc] [-s simul] [-t timelimitForChildren] [-i intervalInMsToLaunchChildren] [-f logfile]\n", argv[0]);
-                exit(EXIT_FAILURE);
+                printf("Usage: %s [-h] [-n proc] [-s simul] [-t timelimit] [-i interval] [-f logfile]\n", argv[0]);
+                exit(0);
+            case 'n': proc = atoi(optarg); break;
+            case 's': simul = atoi(optarg); break;
+            case 't': timelimit = atoi(optarg); break;
+            case 'i': interval = atoi(optarg); break;
+            case 'f': logfilename = optarg; break;
         }
     }
 
-    logFile = fopen(logFileName, "w");
-    if (!logFile) {
-        perror("fopen failed");
-        exit(EXIT_FAILURE);
+    logfile = fopen(logfilename, "w");
+    if (logfile == NULL) {
+        perror("Error opening logfile");
+        exit(1);
     }
 
     shmid = shmget(SHM_KEY, sizeof(SharedClock), IPC_CREAT | 0666);
     if (shmid == -1) {
         perror("shmget failed");
-        exit(EXIT_FAILURE);
+        exit(1);
     }
 
     simClock = (SharedClock *)shmat(shmid, NULL, 0);
     if (simClock == (void *)-1) {
         perror("shmat failed");
-        exit(EXIT_FAILURE);
+        exit(1);
     }
-
-    msqid = msgget(MSG_KEY, IPC_CREAT | 0666);
-    if (msqid == -1) {
-        perror("msgget failed");
-        exit(EXIT_FAILURE);
-    }
-
-    signal(SIGALRM, cleanup);
-    signal(SIGINT, cleanup);
-    alarm(60);
 
     simClock->seconds = 0;
     simClock->nanoseconds = 0;
 
-    int childrenLaunched = 0;
-    int childrenRunning = 0;
+    msqid = msgget(MSG_KEY, IPC_CREAT | 0666);
+    if (msqid == -1) {
+        perror("msgget failed");
+        exit(1);
+    }
 
-    while (childrenLaunched < numProcs || childrenRunning > 0) {
-        if (childrenLaunched < numProcs && childrenRunning < simul) {
-            pid_t pid = fork();
-            if (pid == 0) {
+    signal(SIGINT, sigint_handler);
+
+    int childrenLaunched = 0;
+    int activeChildren = 0;
+
+    while (childrenLaunched < proc || activeChildren > 0) {
+        incrementClock(activeChildren);
+
+        if (childrenLaunched < proc && activeChildren < simul &&
+            (simClock->nanoseconds % (interval * 1000000) == 0)) {
+            pid_t child_pid = fork();
+            if (child_pid == 0) {
                 char maxSecStr[10], maxNanoStr[10];
-                int maxSec = rand() % timeLimit + 1;
-                int maxNano = rand() % 1000000000;
-                snprintf(maxSecStr, 10, "%d", maxSec);
-                snprintf(maxNanoStr, 10, "%d", maxNano);
-                execl("./worker", "./worker", maxSecStr, maxNanoStr, (char *)NULL);
+                snprintf(maxSecStr, 10, "%d", timelimit);
+                snprintf(maxNanoStr, 10, "%d", rand() % 1000000000);
+                execl("./worker", "worker", maxSecStr, maxNanoStr, NULL);
                 perror("execl failed");
-                exit(EXIT_FAILURE);
-            } else if (pid > 0) {
+                exit(1);
+            } else if (child_pid > 0) {
                 for (int i = 0; i < MAX_CHILDREN; i++) {
                     if (!processTable[i].occupied) {
                         processTable[i].occupied = 1;
-                        processTable[i].pid = pid;
-                        processTable[i].startSec = simClock->seconds;
-                        processTable[i].startNano = simClock->nanoseconds;
+                        processTable[i].pid = child_pid;
+                        processTable[i].startS = simClock->seconds;
+                        processTable[i].startN = simClock->nanoseconds;
                         processTable[i].messagesSent = 0;
                         break;
                     }
                 }
                 childrenLaunched++;
-                childrenRunning++;
-            } else {
-                perror("fork failed");
-                exit(EXIT_FAILURE);
+                activeChildren++;
+                printProcessTable();
             }
         }
 
-        incrementClock(childrenRunning);
-
-        struct msgbuf msg;
         for (int i = 0; i < MAX_CHILDREN; i++) {
             if (processTable[i].occupied) {
+                struct msgbuf msg;
                 msg.mtype = processTable[i].pid;
-                msgsnd(msqid, &msg, MSG_SIZE, 0);
-                fprintf(logFile, "OSS: Sending message to worker %d PID %d at time %d:%d\n", i, processTable[i].pid, simClock->seconds, simClock->nanoseconds);
-                msgrcv(msqid, &msg, MSG_SIZE, processTable[i].pid, 0);
-                fprintf(logFile, "OSS: Receiving message from worker %d PID %d at time %d:%d\n", i, processTable[i].pid, simClock->seconds, simClock->nanoseconds);
+                msg.mtext = 1;
+
+                fprintf(logfile, "OSS: Sending message to worker %d PID %d at time %d:%d\n",
+                        i, processTable[i].pid, simClock->seconds, simClock->nanoseconds);
+                if (msgsnd(msqid, &msg, MSG_SIZE, 0) == -1) {
+                    perror("msgsnd failed");
+                    exit(1);
+                }
+                processTable[i].messagesSent++;
+
+                if (msgrcv(msqid, &msg, MSG_SIZE, processTable[i].pid, 0) == -1) {
+                    perror("msgrcv failed");
+                    exit(1);
+                }
+                fprintf(logfile, "OSS: Receiving message from worker %d PID %d at time %d:%d\n",
+                        i, processTable[i].pid, simClock->seconds, simClock->nanoseconds);
+
                 if (msg.mtext == 0) {
-                    fprintf(logFile, "OSS: Worker %d PID %d is planning to terminate.\n", i, processTable[i].pid);
+                    fprintf(logfile, "OSS: Worker %d PID %d is planning to terminate.\n", i, processTable[i].pid);
                     waitpid(processTable[i].pid, NULL, 0);
                     processTable[i].occupied = 0;
-                    childrenRunning--;
-                } else {
-                    processTable[i].messagesSent++;
+                    activeChildren--;
                 }
             }
         }
 
-        usleep(interval * 1000);
+        printProcessTable();
     }
 
-    cleanup(0);
+    cleanup();
     return 0;
 }

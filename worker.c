@@ -70,7 +70,7 @@ void run_worker(int maxSec, int maxNano) {
                 fprintf(stderr, "Worker: msgsnd failed: %s\n", strerror(errno));
                 exit(EXIT_FAILURE);
             }
-            printf("WORKER PID:%d SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d --Terminating after %d iterations\n",
+            printf("WORKER PID:%d SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d --Terminating after sending message back to oss after %d iterations\n",
                    getpid(), simClock->seconds, simClock->nanoseconds, termSec, termNano, iterations);
             break;
         } else {

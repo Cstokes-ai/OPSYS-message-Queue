@@ -1,97 +1,109 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/ipc.h>
 #include <sys/msg.h>
-#include <sys/types.h>
-#include <string.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <errno.h>
+#include <string.h>
 
-#define SHM_KEY 12345  // Shared memory key
-#define MSG_KEY 54321  // Message queue key
+#define SHM_KEY 12345
+#define MSG_KEY 54321
 #define MSG_SIZE sizeof(struct msgbuf) - sizeof(long)
 
-struct simulated_clock {
+typedef struct {
     int seconds;
     int nanoseconds;
-};
+} SharedClock;
 
 struct msgbuf {
     long mtype;
     int mtext;
 };
 
-int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <seconds> <nanoseconds>\n", argv[0]);
+void run_worker(int maxSec, int maxNano) {
+    int shmid = shmget(SHM_KEY, sizeof(SharedClock), 0666);
+    if (shmid == -1) {
+        fprintf(stderr, "Worker: shmget failed: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
-    int termSeconds = atoi(argv[1]);
-    int termNano = atoi(argv[2]);
-
-    int shmid = shmget(SHM_KEY, sizeof(struct simulated_clock), 0666);
-    if (shmid < 0) {
-        perror("shmget");
-        exit(EXIT_FAILURE);
-    }
-    struct simulated_clock* simClock = (struct simulated_clock*) shmat(shmid, NULL, 0);
-    if (simClock == (void*)-1) {
-        perror("shmat");
+    SharedClock *simClock = (SharedClock *)shmat(shmid, NULL, 0);
+    if (simClock == (void *)-1) {
+        fprintf(stderr, "Worker: shmat failed: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
-    int msgQueueId = msgget(MSG_KEY, 0666);
-    if (msgQueueId < 0) {
-        perror("msgget");
+    int msqid = msgget(MSG_KEY, 0666);
+    if (msqid == -1) {
+        fprintf(stderr, "Worker: msgget failed: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
-    struct simulated_clock termTime;
-    termTime.seconds = simClock->seconds + termSeconds;
-    termTime.nanoseconds = simClock->nanoseconds + termNano;
-    if (termTime.nanoseconds >= 1000000000) {
-        termTime.seconds += 1;
-        termTime.nanoseconds -= 1000000000;
+    int termSec = simClock->seconds + maxSec;
+    int termNano = simClock->nanoseconds + maxNano;
+    if (termNano >= 1000000000) {
+        termSec++;
+        termNano -= 1000000000;
     }
 
     printf("WORKER PID:%d PPID:%d SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d --Just Starting\n",
-           getpid(), getppid(), simClock->seconds, simClock->nanoseconds, termTime.seconds, termTime.nanoseconds);
+           getpid(), getppid(), simClock->seconds, simClock->nanoseconds, termSec, termNano);
 
     struct msgbuf msg;
+    msg.mtype = getpid();
+    int iterations = 0;
 
-    while (1) {
-        // Receive a message from oss
-        if (msgrcv(msgQueueId, &msg, MSG_SIZE, 0, 0) == -1) {
-            perror("msgrcv");
+    do {
+        // Wait for message from oss
+        if (msgrcv(msqid, &msg, MSG_SIZE, getpid(), 0) == -1) {
+            fprintf(stderr, "Worker: msgrcv failed: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
         }
-        printf("WORKER: Received message from oss\n");
 
-        if ((simClock->seconds > termTime.seconds) ||
-            (simClock->seconds == termTime.seconds && simClock->nanoseconds >= termTime.nanoseconds)) {
-            printf("WORKER PID:%d PPID:%d SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d --Terminating\n",
-                   getpid(), getppid(), simClock->seconds, simClock->nanoseconds, termTime.seconds, termTime.nanoseconds);
-            msg.mtype = 1;
-            msg.mtext = 0;  // Indicate termination
-            if (msgsnd(msgQueueId, &msg, MSG_SIZE, 0) == -1) {
-                perror("msgsnd");
+        // Check if it's time to terminate
+        if (simClock->seconds > termSec || (simClock->seconds == termSec && simClock->nanoseconds >= termNano)) {
+            msg.mtext = 0; // Indicate termination
+            if (msgsnd(msqid, &msg, MSG_SIZE, 0) == -1) {
+                fprintf(stderr, "Worker: msgsnd failed: %s\n", strerror(errno));
+                exit(EXIT_FAILURE);
             }
+            printf("WORKER PID:%d SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d --Terminating after %d iterations\n",
+                   getpid(), simClock->seconds, simClock->nanoseconds, termSec, termNano, iterations);
             break;
+        } else {
+            msg.mtext = 1; // Indicate still running
+            if (msgsnd(msqid, &msg, MSG_SIZE, 0) == -1) {
+                fprintf(stderr, "Worker: msgsnd failed: %s\n", strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            printf("WORKER PID:%d PPID:%d SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d --%d iteration%s have passed since starting\n",
+                   getpid(), getppid(), simClock->seconds, simClock->nanoseconds, termSec, termNano, ++iterations,
+                   iterations == 1 ? "" : "s");
         }
+    } while (1);
 
-        printf("WORKER PID:%d PPID:%d SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d --Running\n",
-               getpid(), getppid(), simClock->seconds, simClock->nanoseconds, termTime.seconds, termTime.nanoseconds);
+    if (shmdt(simClock) == -1) {
+        fprintf(stderr, "Worker: shmdt failed: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+}
 
-        msg.mtype = 1;
-        msg.mtext = 1;  // Indicate still running
-        if (msgsnd(msgQueueId, &msg, MSG_SIZE, 0) == -1) {
-            perror("msgsnd");
-        }
-
-        sleep(1); // Placeholder for actual time synchronization
+int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <maxSeconds> <maxNanoseconds>\n", argv[0]);
+        return EXIT_FAILURE;
     }
 
-    shmdt(simClock);
-    return 0;
+    int maxSec = atoi(argv[1]);
+    int maxNano = atoi(argv[2]);
+    if (maxSec < 0 || maxNano < 0 || maxNano >= 1000000000) {
+        fprintf(stderr, "Error: Invalid input. maxSeconds must be non-negative and maxNanoseconds must be between 0 and 999999999.\n");
+        return EXIT_FAILURE;
+    }
+
+    run_worker(maxSec, maxNano);
+    return EXIT_SUCCESS;
 }

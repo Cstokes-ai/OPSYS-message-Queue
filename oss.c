@@ -39,9 +39,18 @@ int shmid, msqid;
 SharedClock *simClock;
 FILE *logfile;
 
+int findNextActiveWorker(int currentWorker) {
+    for (int i = 1; i <= MAX_CHILDREN; i++) {
+        int index = (currentWorker + i) % MAX_CHILDREN;
+        if (processTable[index].occupied) {
+            return index;
+        }
+    }
+    return -1;  // No active workers found
+}
+
 void cleanup() {
     shmdt(simClock);
-    shmctl(shmid, IPC_RMID, NULL);
     msgctl(msqid, IPC_RMID, NULL);
     if (logfile) fclose(logfile);
 }
@@ -75,6 +84,9 @@ void printProcessTable() {
 
 int main(int argc, char *argv[]) {
     int opt, proc = 1, simul = 1, timelimit = 2, interval = 100;
+    int childrenLaunched = 0;
+    int activeChildren = 0;
+    int currentWorker = -1;
     char *logfilename = "oss.log";
 
     while ((opt = getopt(argc, argv, "hn:s:t:i:f:")) != -1) {
@@ -119,9 +131,6 @@ int main(int argc, char *argv[]) {
 
     signal(SIGINT, sigint_handler);
 
-    int childrenLaunched = 0;
-    int activeChildren = 0;
-
     while (childrenLaunched < proc || activeChildren > 0) {
         incrementClock(activeChildren);
 
@@ -152,33 +161,37 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        for (int i = 0; i < MAX_CHILDREN; i++) {
-            if (processTable[i].occupied) {
-                struct msgbuf msg;
-                msg.mtype = processTable[i].pid;
-                msg.mtext = 1;
+        currentWorker = findNextActiveWorker(currentWorker);
+        if (currentWorker != -1) {
+            struct msgbuf msg;
+            msg.mtype = processTable[currentWorker].pid;
+            msg.mtext = 1;
 
-                fprintf(logfile, "OSS: Sending message to worker %d PID %d at time %d:%d\n",
-                        i, processTable[i].pid, simClock->seconds, simClock->nanoseconds);
-                if (msgsnd(msqid, &msg, MSG_SIZE, 0) == -1) {
-                    perror("msgsnd failed");
-                    exit(1);
-                }
-                processTable[i].messagesSent++;
+            fprintf(logfile, "OSS: Sending message to worker %d PID %d at time %d:%d\n",
+                    currentWorker, processTable[currentWorker].pid, simClock->seconds, simClock->nanoseconds);
+            fflush(logfile);
 
-                if (msgrcv(msqid, &msg, MSG_SIZE, processTable[i].pid, 0) == -1) {
-                    perror("msgrcv failed");
-                    exit(1);
-                }
-                fprintf(logfile, "OSS: Receiving message from worker %d PID %d at time %d:%d\n",
-                        i, processTable[i].pid, simClock->seconds, simClock->nanoseconds);
+            if (msgsnd(msqid, &msg, MSG_SIZE, 0) == -1) {
+                perror("msgsnd failed");
+                exit(1);
+            }
+            processTable[currentWorker].messagesSent++;
 
-                if (msg.mtext == 0) {
-                    fprintf(logfile, "OSS: Worker %d PID %d is planning to terminate.\n", i, processTable[i].pid);
-                    waitpid(processTable[i].pid, NULL, 0);
-                    processTable[i].occupied = 0;
-                    activeChildren--;
-                }
+            // Wait for response from that worker
+            if (msgrcv(msqid, &msg, MSG_SIZE, processTable[currentWorker].pid, 0) == -1) {
+                perror("msgrcv failed");
+                exit(1);
+            }
+
+            fprintf(logfile, "OSS: Receiving message from worker %d PID %d at time %d:%d\n",
+                    currentWorker, processTable[currentWorker].pid, simClock->seconds, simClock->nanoseconds);
+            fflush(logfile);
+
+            if (msg.mtext == 0) {
+                fprintf(logfile, "OSS: Worker %d PID %d is planning to terminate.\n", currentWorker, processTable[currentWorker].pid);
+                waitpid(processTable[currentWorker].pid, NULL, 0);
+                processTable[currentWorker].occupied = 0;
+                activeChildren--;
             }
         }
 
